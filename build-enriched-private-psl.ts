@@ -1,12 +1,15 @@
 import { spawnSync } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const PSL_DIR = path.resolve("psl");
 const PSL_FILE = path.join(PSL_DIR, "public_suffix_list.dat");
 const PRS_DIR = path.resolve("data", "prs");
 const DOMAIN_CONTEXT_DIR = path.resolve("data", "domain-context");
+const COMMONCRAWL_HOSTS_FILE = path.resolve("data", "hosts.txt");
 const OUTPUT_FILE = path.resolve("output.dat");
 
 const BEGIN_PRIVATE_DOMAINS_MARKER = "// ===BEGIN PRIVATE DOMAINS===";
@@ -28,6 +31,7 @@ const PSLTOOL_FMT_COMMIT_GREP = "psltool fmt";
 const MAX_GIT_BUFFER_BYTES = 256 * 1024 * 1024;
 const MAX_HEADER_BODY_CHARS = 8_000;
 const MAX_CONTEXT_TEXT_CHARS = 260;
+const SUBDOMAIN_PROGRESS_EVERY = 2_000_000;
 
 const LABEL_PATTERN = String.raw`[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?`;
 const LABEL_REGEX = new RegExp(`^${LABEL_PATTERN}$`, "u");
@@ -83,6 +87,7 @@ type PullRecord = {
 
 type DomainContextSummary = {
   summary: string;
+  subdomainSummary: string;
 };
 
 type BuildSummary = {
@@ -97,6 +102,10 @@ type BuildSummary = {
   contextFile: string;
   contextsLoaded: number;
   contextParseFailures: number;
+  subdomainHostsFile: string;
+  subdomainDomains: number;
+  subdomainHostsScanned: number;
+  subdomainHostsMatched: number;
 };
 
 export async function buildEnrichedPrivatePslOutput(): Promise<BuildSummary> {
@@ -151,12 +160,17 @@ export async function buildEnrichedPrivatePslOutput(): Promise<BuildSummary> {
   const prMap = await loadPullRequests(prNumbers);
   const latestDomainContextPath = await findLatestDomainContextPath();
   const domainContext = await loadDomainContext(latestDomainContextPath);
+  const subdomainUsage = await loadSubdomainUsage(privateSection.lines);
+  const combinedContextByDomain = withSubdomainSummaries(
+    domainContext.contextByDomain,
+    subdomainUsage.summaryByDomain,
+  );
 
   const rendered = renderEnrichedPrivateSection(
     privateSection.lines,
     repaired.records,
     prMap,
-    domainContext.contextByDomain,
+    combinedContextByDomain,
   );
 
   await writeFile(OUTPUT_FILE, `${rendered.join("\n")}\n`, "utf8");
@@ -175,6 +189,10 @@ export async function buildEnrichedPrivatePslOutput(): Promise<BuildSummary> {
     contextFile: latestDomainContextPath,
     contextsLoaded: domainContext.contextByDomain.size,
     contextParseFailures: domainContext.parseFailures,
+    subdomainHostsFile: COMMONCRAWL_HOSTS_FILE,
+    subdomainDomains: subdomainUsage.summaryByDomain.size,
+    subdomainHostsScanned: subdomainUsage.hostsScanned,
+    subdomainHostsMatched: subdomainUsage.hostsMatched,
   };
 }
 
@@ -678,11 +696,316 @@ async function loadDomainContext(filePath: string) {
   };
 }
 
+type SubdomainUsage = {
+  summaryByDomain: Map<string, string>;
+  hostsScanned: number;
+  hostsMatched: number;
+};
+
+type MutableSubdomainStats = {
+  count: number;
+  sharedSuffixReversed: string;
+};
+
+type ReversedPrefixInterval = {
+  domain: string;
+  reversedDomain: string;
+  start: string;
+  end: string;
+};
+
+async function loadSubdomainUsage(privateLines: string[]): Promise<SubdomainUsage> {
+  try {
+    await stat(COMMONCRAWL_HOSTS_FILE);
+  } catch {
+    throw new Error(`Missing Common Crawl hosts file: ${COMMONCRAWL_HOSTS_FILE}`);
+  }
+
+  const targetDomains = collectPrivateSectionDomains(privateLines);
+  const intervals = buildReversedPrefixIntervals(targetDomains);
+  const reversedDomainByDomain = new Map(intervals.map((interval) => [interval.domain, interval.reversedDomain]));
+  const statsByDomain = new Map<string, MutableSubdomainStats>(
+    intervals.map((interval) => [interval.domain, { count: 0, sharedSuffixReversed: interval.reversedDomain }]),
+  );
+
+  const lineReader = createInterface({
+    input: createReadStream(COMMONCRAWL_HOSTS_FILE, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  const activeIntervalsByDomain = new Map<string, ReversedPrefixInterval>();
+  const activeByEndHeap: ReversedPrefixInterval[] = [];
+  let nextIntervalIndex = 0;
+  let previousHostReversed = "";
+  let hostsScanned = 0;
+  let hostsMatched = 0;
+
+  for await (const rawLine of lineReader) {
+    hostsScanned += 1;
+    const hostReversed = normalizeReversedHostEntry(rawLine);
+    if (!hostReversed) {
+      continue;
+    }
+
+    if (previousHostReversed && hostReversed < previousHostReversed) {
+      throw new Error(
+        `Common Crawl hosts file is not sorted at line=${hostsScanned}: ${hostReversed} < ${previousHostReversed}`,
+      );
+    }
+    previousHostReversed = hostReversed;
+
+    while (activeByEndHeap.length > 0) {
+      const interval = activeByEndHeap[0];
+      if (interval.end >= hostReversed) {
+        break;
+      }
+
+      const expired = popIntervalByEnd(activeByEndHeap);
+      if (!expired) {
+        break;
+      }
+      activeIntervalsByDomain.delete(expired.domain);
+    }
+
+    while (nextIntervalIndex < intervals.length && intervals[nextIntervalIndex].start <= hostReversed) {
+      const interval = intervals[nextIntervalIndex];
+      if (hostReversed <= interval.end) {
+        activeIntervalsByDomain.set(interval.domain, interval);
+        pushIntervalByEnd(activeByEndHeap, interval);
+      }
+      nextIntervalIndex += 1;
+    }
+
+    if (activeIntervalsByDomain.size === 0) {
+      continue;
+    }
+
+    for (const interval of activeIntervalsByDomain.values()) {
+      const stats = statsByDomain.get(interval.domain);
+      if (!stats) {
+        continue;
+      }
+
+      stats.count += 1;
+      stats.sharedSuffixReversed = stats.count === 1
+        ? hostReversed
+        : longestCommonLabelPrefix(stats.sharedSuffixReversed, hostReversed) || interval.reversedDomain;
+      hostsMatched += 1;
+    }
+
+    if (hostsScanned % SUBDOMAIN_PROGRESS_EVERY === 0) {
+      console.log(`Subdomain usage progress: scanned=${hostsScanned} matched=${hostsMatched}`);
+    }
+  }
+
+  const summaryByDomain = new Map<string, string>();
+  for (const [domain, stats] of statsByDomain) {
+    const sharedSuffix = reverseDomainLabels(
+      stats.sharedSuffixReversed || reversedDomainByDomain.get(domain) || domain,
+    );
+    summaryByDomain.set(
+      domain,
+      formatSubdomainSummary(domain, stats.count, sharedSuffix),
+    );
+  }
+
+  console.log(
+    `Loaded subdomain usage: domains=${summaryByDomain.size} scanned=${hostsScanned} matched=${hostsMatched} file=${path.relative(process.cwd(), COMMONCRAWL_HOSTS_FILE)}`,
+  );
+
+  return {
+    summaryByDomain,
+    hostsScanned,
+    hostsMatched,
+  };
+}
+
+function collectPrivateSectionDomains(privateLines: string[]) {
+  const domains = new Set<string>();
+
+  for (const line of privateLines) {
+    const domain = extractDomainFromPslRuleLine(line);
+    if (domain) {
+      domains.add(domain);
+    }
+  }
+
+  return [...domains].sort((a, b) => a.localeCompare(b));
+}
+
+function buildReversedPrefixIntervals(domains: string[]) {
+  const intervals = domains.map((domain) => {
+    const reversed = reverseDomainLabels(domain);
+    const start = `${reversed}.`;
+    return {
+      domain,
+      reversedDomain: reversed,
+      start,
+      end: `${start}\uffff`,
+    };
+  });
+
+  intervals.sort((a, b) => a.start.localeCompare(b.start) || a.domain.localeCompare(b.domain));
+  return intervals;
+}
+
+function normalizeReversedHostEntry(rawHost: string) {
+  const trimmed = rawHost.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const withoutTrailingDot = trimmed.endsWith(".")
+    ? trimmed.slice(0, -1)
+    : trimmed;
+  if (!withoutTrailingDot.includes(".")) {
+    return "";
+  }
+
+  return withoutTrailingDot.toLowerCase();
+}
+
+function reverseDomainLabels(domain: string) {
+  return domain.split(".").reverse().join(".");
+}
+
+function pushIntervalByEnd(heap: ReversedPrefixInterval[], value: ReversedPrefixInterval) {
+  heap.push(value);
+  let index = heap.length - 1;
+
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if (heap[parent].end <= heap[index].end) {
+      break;
+    }
+    const tmp = heap[parent];
+    heap[parent] = heap[index];
+    heap[index] = tmp;
+    index = parent;
+  }
+}
+
+function popIntervalByEnd(heap: ReversedPrefixInterval[]) {
+  if (heap.length === 0) {
+    return null;
+  }
+
+  const root = heap[0];
+  const last = heap.pop();
+  if (!last || heap.length === 0) {
+    return root;
+  }
+
+  heap[0] = last;
+  let index = 0;
+
+  while (true) {
+    const left = (index * 2) + 1;
+    const right = left + 1;
+    let smallest = index;
+
+    if (left < heap.length && heap[left].end < heap[smallest].end) {
+      smallest = left;
+    }
+    if (right < heap.length && heap[right].end < heap[smallest].end) {
+      smallest = right;
+    }
+    if (smallest === index) {
+      break;
+    }
+
+    const tmp = heap[index];
+    heap[index] = heap[smallest];
+    heap[smallest] = tmp;
+    index = smallest;
+  }
+
+  return root;
+}
+
+function withSubdomainSummaries(
+  contextByDomain: Map<string, DomainContextSummary>,
+  subdomainSummaryByDomain: Map<string, string>,
+) {
+  const merged = new Map<string, DomainContextSummary>();
+
+  for (const [domain, context] of contextByDomain) {
+    merged.set(domain, {
+      summary: context.summary,
+      subdomainSummary: context.subdomainSummary,
+    });
+  }
+
+  for (const [domain, subdomainSummary] of subdomainSummaryByDomain) {
+    const existing = merged.get(domain);
+    if (!existing) {
+      merged.set(domain, {
+        summary: "",
+        subdomainSummary,
+      });
+      continue;
+    }
+
+    existing.subdomainSummary = subdomainSummary;
+  }
+
+  return merged;
+}
+
+function formatSubdomainSummary(domain: string, count: number, sharedSuffix: string) {
+  if (count === 0) {
+    return "0 subdomains";
+  }
+
+  const base = count === 1 ? "1 subdomain" : `${count} subdomains`;
+  if (count > 1 && sharedSuffix && sharedSuffix !== domain) {
+    return `${base}, all under ${sharedSuffix}`;
+  }
+
+  return base;
+}
+
+function longestCommonLabelPrefix(left: string, right: string) {
+  const max = Math.min(left.length, right.length);
+  let index = 0;
+  let lastDot = -1;
+
+  while (index < max) {
+    if (left.charCodeAt(index) !== right.charCodeAt(index)) {
+      break;
+    }
+    if (left.charCodeAt(index) === 46) {
+      lastDot = index;
+    }
+    index += 1;
+  }
+
+  if (index === max) {
+    if (left.length === right.length) {
+      return left;
+    }
+
+    const shorter = left.length < right.length ? left : right;
+    const longer = left.length < right.length ? right : left;
+    if (longer.charCodeAt(max) === 46) {
+      return shorter;
+    }
+  }
+
+  if (lastDot === -1) {
+    return "";
+  }
+
+  return left.slice(0, lastDot);
+}
+
 function summarizeDomainContext(record: any): DomainContextSummary {
   const attempt = pickSuccessfulAttempt(record);
   const final = attempt?.final;
   if (!final) {
-    return { summary: "" };
+    return {
+      summary: "",
+      subdomainSummary: "",
+    };
   }
   const redirectDetail = summarizeRedirectDetail(attempt);
 
@@ -703,16 +1026,19 @@ function summarizeDomainContext(record: any): DomainContextSummary {
         `text = ${snippet}`,
         redirectDetail,
       ]),
+      subdomainSummary: "",
     };
   }
   if (title) {
     return {
       summary: joinSummaryParts([`title = ${title}`, redirectDetail]),
+      subdomainSummary: "",
     };
   }
   if (snippet) {
     return {
       summary: joinSummaryParts([`text = ${snippet}`, redirectDetail]),
+      subdomainSummary: "",
     };
   }
 
@@ -722,6 +1048,7 @@ function summarizeDomainContext(record: any): DomainContextSummary {
       status === null ? "reachable" : `status = ${status}`,
       redirectDetail,
     ]),
+    subdomainSummary: "",
   };
 }
 
@@ -1026,7 +1353,8 @@ function appendDomainContext(
   line: string,
   contextByDomain: Map<string, DomainContextSummary>,
 ) {
-  const domains = extractDomainsFromLine(line);
+  const ruleDomain = extractDomainFromPslRuleLine(line);
+  const domains = ruleDomain ? [ruleDomain] : extractDomainsFromTextLine(line);
   if (domains.length === 0) {
     return line;
   }
@@ -1034,7 +1362,11 @@ function appendDomainContext(
   const comments = domains
     .map((domain) => ({
       domain,
-      summary: resolveDomainContextSummary(domain, contextByDomain),
+      summary: resolveDomainContextSummary(
+        domain,
+        contextByDomain,
+        domain === ruleDomain,
+      ),
     }))
     .filter((entry) => entry.summary.length > 0);
 
@@ -1055,21 +1387,31 @@ function appendDomainContext(
 function resolveDomainContextSummary(
   domain: string,
   contextByDomain: Map<string, DomainContextSummary>,
+  includeSubdomainSummary: boolean,
 ) {
-  const direct = contextByDomain.get(domain)?.summary.trim() ?? "";
+  const direct = summarizeContextEntry(
+    contextByDomain.get(domain),
+    includeSubdomainSummary,
+  );
   if (direct) {
     return direct;
   }
 
   if (domain.startsWith("www.")) {
     const withoutWww = domain.slice(4);
-    const fallback = contextByDomain.get(withoutWww)?.summary.trim() ?? "";
+    const fallback = summarizeContextEntry(
+      contextByDomain.get(withoutWww),
+      includeSubdomainSummary,
+    );
     if (fallback) {
       return fallback;
     }
   } else {
     const withWww = `www.${domain}`;
-    const fallback = contextByDomain.get(withWww)?.summary.trim() ?? "";
+    const fallback = summarizeContextEntry(
+      contextByDomain.get(withWww),
+      includeSubdomainSummary,
+    );
     if (fallback) {
       return fallback;
     }
@@ -1078,7 +1420,20 @@ function resolveDomainContextSummary(
   return "";
 }
 
-function extractDomainsFromLine(line: string) {
+function summarizeContextEntry(
+  entry: DomainContextSummary | undefined,
+  includeSubdomainSummary: boolean,
+) {
+  if (!entry) {
+    return "";
+  }
+  if (!includeSubdomainSummary) {
+    return entry.summary.trim();
+  }
+  return joinSummaryParts([entry.subdomainSummary, entry.summary]);
+}
+
+function extractDomainsFromTextLine(line: string) {
   const domains: string[] = [];
   const seen = new Set<string>();
 
@@ -1094,6 +1449,40 @@ function extractDomainsFromLine(line: string) {
   }
 
   return removeBareWhenWwwExists(domains);
+}
+
+function extractDomainFromPslRuleLine(line: string) {
+  const normalizedLine = normalizePslRuleLine(line);
+  if (!normalizedLine) {
+    return null;
+  }
+
+  let candidate = normalizedLine;
+  if (candidate.startsWith("!")) {
+    candidate = candidate.slice(1);
+  }
+  if (candidate.startsWith("*.")) {
+    candidate = candidate.slice(2);
+  }
+
+  return normalizeDomain(candidate);
+}
+
+function normalizePslRuleLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("//")) {
+    return "";
+  }
+
+  const commentStart = trimmed.indexOf("//");
+  const withoutComment = commentStart === -1
+    ? trimmed
+    : trimmed.slice(0, commentStart).trim();
+  if (!withoutComment) {
+    return "";
+  }
+
+  return withoutComment.split(/\s+/u)[0] ?? "";
 }
 
 function normalizeDomain(raw: string) {

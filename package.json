@@ -2,5 +2,8 @@
   "type": "module",
   "dependencies": {
     "octokit": "^5.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3"
   }
 }
