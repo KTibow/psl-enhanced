@@ -1,6 +1,11 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { createReadStream, createWriteStream, type ReadStream, type WriteStream } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  type ReadStream,
+  type WriteStream,
+} from "node:fs";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
@@ -88,7 +93,10 @@ export async function buildHostsUnoccupiedPreliminary(
   await mkdir(tempDirPath, { recursive: true });
   await mkdir(path.dirname(outputFilePath), { recursive: true });
 
-  const output = createWriteStream(outputFilePath, { flags: "w", encoding: "utf8" });
+  const output = createWriteStream(outputFilePath, {
+    flags: "w",
+    encoding: "utf8",
+  });
   const hosts = createHostReader(hostsFilePath);
 
   console.log(
@@ -145,7 +153,10 @@ export async function buildHostsUnoccupiedPreliminary(
       });
       liveDomainsRaw += liveRawWritten;
 
-      await sortUniqueFile(tempPaths.crawledRawPath, tempPaths.crawledUniquePath);
+      await sortUniqueFile(
+        tempPaths.crawledRawPath,
+        tempPaths.crawledUniquePath,
+      );
       await sortUniqueFile(tempPaths.liveRawPath, tempPaths.liveUniquePath);
 
       const subtractionSummary = await appendSortedDifference({
@@ -166,10 +177,7 @@ export async function buildHostsUnoccupiedPreliminary(
         `Zone ${currentZone}: crawled_raw=${crawledRawSummary.rawDomainsWritten} crawled_unique=${subtractionSummary.leftLinesRead} live_raw=${liveRawWritten} live_unique=${subtractionSummary.rightLinesRead} unoccupied=${subtractionSummary.outputLinesWritten}`,
       );
 
-      if (
-        zonesCompared % ZONE_PROGRESS_EVERY === 0 ||
-        currentHost === null
-      ) {
+      if (zonesCompared % ZONE_PROGRESS_EVERY === 0 || currentHost === null) {
         console.log(
           `Zone progress: compared=${zonesCompared}/${relevantZones.length} zones_with_results=${zonesWithResults} hosts_scanned=${hosts.hostsScanned} unoccupied=${unoccupiedDomains}`,
         );
@@ -181,11 +189,9 @@ export async function buildHostsUnoccupiedPreliminary(
     await once(output, "finish");
   }
 
-  if (SORT_FINAL_OUTPUT) {
-    await sortUniqueFile(outputFilePath, outputFilePath);
-  }
-
-  console.log(`Wrote ${unoccupiedDomains} domains to ${path.relative(process.cwd(), outputFilePath)}`);
+  console.log(
+    `Wrote ${unoccupiedDomains} domains to ${path.relative(process.cwd(), outputFilePath)}`,
+  );
 
   return {
     outputPath: outputFilePath,
@@ -235,7 +241,11 @@ async function loadZoneFiles(
     zoneFiles.set(zone, path.join(zonesDirPath, entry.name));
   }
 
-  return new Map([...zoneFiles.entries()].sort(([left], [right]) => compareAscii(left, right)));
+  return new Map(
+    [...zoneFiles.entries()].sort(([left], [right]) =>
+      compareAscii(left, right),
+    ),
+  );
 }
 
 function createHostReader(hostsFilePath: string): HostReader {
@@ -302,7 +312,10 @@ async function writeCrawledDomainsForZone(options: {
   crawledRawPath: string;
 }): Promise<RawZoneCrawlSummary> {
   const { zone, firstHost, hosts, crawledRawPath } = options;
-  const output = createWriteStream(crawledRawPath, { flags: "w", encoding: "utf8" });
+  const output = createWriteStream(crawledRawPath, {
+    flags: "w",
+    encoding: "utf8",
+  });
 
   let currentHost: string | null = firstHost;
   let hostsConsumed = 0;
@@ -336,7 +349,10 @@ async function writeLiveDomainsForZone(options: {
   liveRawPath: string;
 }) {
   const { zone, zoneFilePath, liveRawPath } = options;
-  const output = createWriteStream(liveRawPath, { flags: "w", encoding: "utf8" });
+  const output = createWriteStream(liveRawPath, {
+    flags: "w",
+    encoding: "utf8",
+  });
   const stream = createReadStream(zoneFilePath, {
     encoding: "utf8",
     highWaterMark: ZONE_READ_HIGH_WATER_MARK,
@@ -554,7 +570,9 @@ function readToken(line: string, tokenIndex: number) {
 }
 
 function isWhitespace(charCode: number) {
-  return charCode === 9 || charCode === 10 || charCode === 13 || charCode === 32;
+  return (
+    charCode === 9 || charCode === 10 || charCode === 13 || charCode === 32
+  );
 }
 
 function normalizeReversedHostEntry(rawHost: string) {
@@ -588,9 +606,10 @@ function toEffectiveDomain(reversedHost: string, zone: string) {
   }
 
   const secondDot = reversedHost.indexOf(".", firstDot + 1);
-  const secondLabel = secondDot === -1
-    ? reversedHost.slice(firstDot + 1)
-    : reversedHost.slice(firstDot + 1, secondDot);
+  const secondLabel =
+    secondDot === -1
+      ? reversedHost.slice(firstDot + 1)
+      : reversedHost.slice(firstDot + 1, secondDot);
 
   if (!secondLabel) {
     return "";
